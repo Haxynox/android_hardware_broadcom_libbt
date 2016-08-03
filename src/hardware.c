@@ -106,6 +106,18 @@
       next 2 bytes are for codec type */
 #define SCO_CODEC_PARAM_SIZE                    3
 
+#if (USE_AXI_BRIDGE_LOCK == TRUE)
+#define BTLOCK_DEV "/dev/btlock"
+static int btlock_cookie = 'B' | 'T'<<8 | '3'<<16 | '5'<<24;
+struct btlock {
+    int lock;
+    int cookie;
+};
+#endif
+#ifdef SAMSUNG_BLUETOOTH
+#define CID_PATH "/data/.cid.info"
+#endif
+
 /******************************************************************************
 **  Local type definitions
 ******************************************************************************/
@@ -119,7 +131,8 @@ enum {
     HW_CFG_DL_MINIDRIVER,
     HW_CFG_DL_FW_PATCH,
     HW_CFG_SET_UART_BAUD_2,
-    HW_CFG_SET_BD_ADDR
+    HW_CFG_SET_BD_ADDR,
+    HW_CFG_DL_FW_PRE_PATCH
 #if (USE_CONTROLLER_BDADDR == TRUE)
     , HW_CFG_READ_BD_ADDR
 #endif
@@ -172,6 +185,7 @@ extern uint8_t vnd_local_bd_addr[BD_ADDR_LEN];
 
 static char fw_patchfile_path[256] = FW_PATCHFILE_LOCATION;
 static char fw_patchfile_name[128] = { 0 };
+static char fw_prepatch_name[384] = FW_PRE_PATCH;
 #if (VENDOR_LIB_RUNTIME_TUNING_ENABLED == TRUE)
 static int fw_patch_settlement_delay = -1;
 #endif
@@ -416,6 +430,54 @@ static int hw_strncmp (const char *p_str1, const char *p_str2, const int len)
     return 0;
 }
 
+#ifdef SAMSUNG_BLUETOOTH
+/*******************************************************************************
+**
+** Function         hw_samsung_bluetooth_type
+**
+** Description      Returns the type of bluetooth chip present in samsung
+**                  device.
+**
+** Returns          Returns char* (bluetooth type)
+**
+*******************************************************************************/
+static const char *hw_samsung_bluetooth_type()
+{
+    char buf[10];
+    int fd;
+    ssize_t nread;
+
+    fd = open(CID_PATH, O_RDONLY);
+    if (fd < 0) {
+        ALOGE("Couldn't open file %s for reading", CID_PATH);
+        return NULL;
+    }
+
+    nread = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (nread <= 0) {
+        return NULL;
+    }
+
+    if (strncmp(buf, "murata", 6) == 0)
+        return "murata";
+
+    if (strncmp(buf, "semcove", 7) == 0)
+        return "semcove";
+
+    if (strncmp(buf, "semcosh", 7) == 0)
+        return "semcosh";
+
+    if (strncmp(buf, "semco", 5) == 0)
+        return "semco";
+
+    if (strncmp(buf, "wisol", 5) == 0)
+        return "wisol";
+
+    return NULL;
+}
+#endif
+
 /*******************************************************************************
 **
 ** Function         hw_config_findpatch
@@ -461,9 +523,28 @@ static uint8_t hw_config_findpatch(char *p_chip_id_str)
         while ((dp = readdir(dirp)) != NULL)
         {
             /* Check if filename starts with chip-id name */
-            if ((hw_strncmp(dp->d_name, p_chip_id_str, strlen(p_chip_id_str)) \
-                ) == 0)
+            int cmp;
+
+            cmp = hw_strncmp(dp->d_name, p_chip_id_str, strlen(p_chip_id_str));
+            if (cmp == 0)
             {
+#ifdef SAMSUNG_BLUETOOTH
+                const char *type = hw_samsung_bluetooth_type();
+
+                if (type != NULL) {
+                    const char *needle;
+
+                    BTHWDBG("Looking for Samsung %s patchfile flavour in %s",
+                            type,
+                            dp->d_name);
+
+                    needle = strstr(dp->d_name, type);
+                    if (needle == NULL) {
+                        continue;
+                    }
+                }
+#endif
+
                 /* Check if it has .hcd extenstion */
                 filenamelen = strlen(dp->d_name);
                 if ((filenamelen >= FW_PATCHFILE_EXTENSION_LEN) &&
@@ -603,6 +684,53 @@ static uint8_t hw_config_read_bdaddr(HC_BT_HDR *p_buf)
 }
 #endif // (USE_CONTROLLER_BDADDR == TRUE)
 
+#if (USE_AXI_BRIDGE_LOCK == TRUE)
+/*******************************************************************************
+**
+** Function         axi_bridge_lock
+**
+** Description      Take semaphore to prevent concurrent BT/WiFi firmware loading
+**
+*******************************************************************************/
+void axi_bridge_lock(int locked)
+{
+    int fd = -1;
+    struct btlock lock;
+    int ret = 0;
+
+    ALOGI("axi_bridge_lock: locked=%d", locked);
+
+    fd = open(BTLOCK_DEV, O_WRONLY);
+    if (fd < 0)
+    {
+        ALOGE("axi_bridge_lock open failed: %s (%d)",
+                strerror(errno), errno);
+        return;
+    }
+
+    lock.lock = locked;
+    lock.cookie = btlock_cookie;
+
+    if (locked)
+    {
+        while ((ret = write(fd, &lock, sizeof(lock))) != 0) {
+            ALOGE("axi_bridge_lock acquire: %s (%d)",
+                    strerror(errno), errno);
+            usleep(10000);
+        }
+    } else {
+        if (write(fd, &lock, sizeof(lock)) < 0)
+        {
+            ALOGE("axi_bridge_lock write failed: %s (%d)",
+                    strerror(errno), errno);
+        }
+    }
+
+    if (fd >= 0)
+        close(fd);
+}
+#endif // USE_AXI_BRIDGE_LOCK
+
 /*******************************************************************************
 **
 ** Function         hw_config_cback
@@ -652,6 +780,44 @@ void hw_config_cback(void *p_mem)
                 userial_vendor_set_baud( \
                     line_speed_to_userial_baud(UART_TARGET_BAUD_RATE) \
                 );
+
+                hw_cfg_cb.fw_fd = -1;
+
+                // load the prepatch
+                if (strlen(fw_prepatch_name) &&
+                        (hw_cfg_cb.fw_fd = open(fw_prepatch_name, O_RDONLY)) > -1)
+                {
+                    ALOGI("bt vendor lib: loading prepatch %s", fw_prepatch_name);
+                }
+
+                hw_cfg_cb.state = HW_CFG_DL_FW_PRE_PATCH;
+                // intentional fallthru
+
+            case HW_CFG_DL_FW_PRE_PATCH:
+                if (hw_cfg_cb.fw_fd > -1) {
+                    p_buf->len = read(hw_cfg_cb.fw_fd, p, HCI_CMD_PREAMBLE_SIZE);
+                    if (p_buf->len > 0)
+                    {
+                        if ((p_buf->len < HCI_CMD_PREAMBLE_SIZE) || \
+                            (opcode == HCI_VSC_LAUNCH_RAM))
+                        {
+                            ALOGW("firmware patch file might be altered!");
+                        }
+                        else
+                        {
+                            p_buf->len += read(hw_cfg_cb.fw_fd, \
+                                               p+HCI_CMD_PREAMBLE_SIZE,\
+                                               *(p+HCD_REC_PAYLOAD_LEN_BYTE));
+                            STREAM_TO_UINT16(opcode,p);
+                            is_proceeding = bt_vendor_cbacks->xmit_cb(opcode, \
+                                                    p_buf, hw_config_cback);
+                            break;
+                        }
+                    }
+
+                    close(hw_cfg_cb.fw_fd);
+                    hw_cfg_cb.fw_fd = -1;
+                }
 
                 /* read local name */
                 UINT16_TO_STREAM(p, HCI_READ_LOCAL_NAME);
@@ -748,6 +914,10 @@ void hw_config_cback(void *p_mem)
 
                 close(hw_cfg_cb.fw_fd);
                 hw_cfg_cb.fw_fd = -1;
+
+#if (USE_AXI_BRIDGE_LOCK == TRUE)
+                axi_bridge_lock(0);
+#endif
 
                 /* Normally the firmware patch configuration file
                  * sets the new starting baud rate at 115200.
@@ -878,8 +1048,15 @@ void hw_config_cback(void *p_mem)
     } // if (p_buf != NULL)
 
     /* Free the RX event buffer */
+
+// On manta this causes a crash due to an overrun elsewhere.
+// Sad as it is, if we just do not do the free here we'll just leak less than 4K each time BT is turned on.
+// And since when it is turned off, the process dies, this realy only costs us 4K total.
+// I'm willing to part with 4K to avoid debugging bluedroid
+#ifndef MANTA_BUG
     if (bt_vendor_cbacks)
         bt_vendor_cbacks->dealloc(p_evt_buf);
+#endif
 
     if (is_proceeding == FALSE)
     {
@@ -1512,6 +1689,25 @@ int hw_set_patch_file_name(char *p_conf_name, char *p_conf_value, int param)
 
     return 0;
 }
+
+/*******************************************************************************
+**
+** Function        hw_set_pre_patch_file_name
+**
+** Description     Give the specific firmware pre-patch filename
+**
+** Returns         0 : Success
+**                 Otherwise : Fail
+**
+*******************************************************************************/
+int hw_set_pre_patch_file_name(char *p_conf_name, char *p_conf_value, int param)
+{
+
+    strcpy(fw_prepatch_name, p_conf_value);
+
+    return 0;
+}
+
 
 #if (VENDOR_LIB_RUNTIME_TUNING_ENABLED == TRUE)
 /*******************************************************************************
